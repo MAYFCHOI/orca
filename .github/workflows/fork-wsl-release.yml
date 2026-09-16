@@ -1,0 +1,205 @@
+# Fork-only workflow (MAYFCHOI/orca). Keeps the wsl-patches branch rebased on the
+# newest upstream stable tag and publishes an unsigned Windows build of it to this
+# fork's releases as vX.Y.Z-wsl.N. The installed app updates from those releases
+# (see config/electron-builder.config.cjs, ORCA_WIN_FORK).
+name: fork-wsl-release
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Upstream tag to rebase onto (default = newest vX.Y.Z)
+        required: false
+        type: string
+      force_build:
+        description: Build even when nothing changed
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: fork-wsl-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  PATCH_BRANCH: wsl-patches
+
+jobs:
+  sync:
+    if: github.repository == 'MAYFCHOI/orca'
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+      sha: ${{ steps.plan.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.PATCH_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Rebase wsl-patches onto the newest upstream stable tag
+        id: plan
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+          FORCE_BUILD: ${{ inputs.force_build }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/stablyai/orca.git
+          git fetch -q upstream 'refs/tags/v*:refs/tags/v*'
+
+          base="$(git describe --tags --abbrev=0 --exclude '*-wsl.*' HEAD)"
+          if [[ -n "$REQUESTED_TAG" ]]; then
+            target="$REQUESTED_TAG"
+          else
+            target="$(git tag --list 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
+          fi
+          echo "base=$base target=$target"
+
+          if [[ "$target" != "$base" ]]; then
+            if ! git rebase --onto "$target" "$base" "$PATCH_BRANCH"; then
+              git rebase --abort || true
+              title="wsl-patches: rebase onto $target conflicts"
+              if ! gh issue list --search "in:title \"$title\"" --state open --json number --jq '.[0].number' | grep -q .; then
+                gh issue create --title "$title" --body "Automatic rebase of \`$PATCH_BRANCH\` from \`$base\` onto \`$target\` hit conflicts. Rebase by hand: \`git rebase --onto $target $base $PATCH_BRANCH\`, push with \`--force-with-lease\`, then re-run this workflow." --label fork-sync || true
+              fi
+              echo "::error::rebase onto $target conflicts; issue opened"
+              exit 1
+            fi
+            git push --force-with-lease origin "$PATCH_BRANCH"
+            base="$target"
+          fi
+
+          sha="$(git rev-parse HEAD)"
+          built_here="$(git tag --points-at HEAD --list "$base-wsl.*" | sort -V | tail -1 || true)"
+          if [[ -n "$built_here" && "$FORCE_BUILD" != "true" ]]; then
+            echo "HEAD already built as $built_here; nothing to do"
+            echo "build=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          n="$(( $(git tag --list "$base-wsl.*" | wc -l) + 1 ))"
+          tag="$base-wsl.$n"
+          git tag -a "$tag" -m "$tag: $PATCH_BRANCH rebased on $base"
+          git push origin "refs/tags/$tag"
+          {
+            echo "build=true"
+            echo "tag=$tag"
+            echo "version=${tag#v}"
+            echo "sha=$sha"
+          } >>"$GITHUB_OUTPUT"
+
+  build-win:
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    # Same image as upstream release-cut: windows-latest broke node-gyp VS detection.
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+      TAG: ${{ needs.sync.outputs.tag }}
+      VERSION: ${{ needs.sync.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/setup@v2
+        with:
+          install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+          cache: pnpm
+
+      - name: Cache electron-builder downloads
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~\AppData\Local\electron\Cache
+            ~\AppData\Local\electron-builder\Cache
+          key: electron-builder-win-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            electron-builder-win-
+
+      - name: Install dependencies
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 30
+          command: pnpm install --frozen-lockfile
+
+      - name: Build Windows process-table addon for the relay
+        shell: bash
+        run: |
+          node config/scripts/build-windows-process-tree-relay-addon.mjs --arch=x64
+          node config/scripts/build-windows-process-tree-relay-addon.mjs --arch=arm64
+
+      - name: Build app
+        shell: bash
+        run: pnpm build:release
+        env:
+          ORCA_REQUIRE_RELAY_NATIVE_ADDONS: 'x64,arm64'
+
+      - name: Create the fork release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          upstream="${TAG%-wsl.*}"
+          gh release view "$TAG" --json tagName >/dev/null 2>&1 || gh release create "$TAG" \
+            --prerelease --title "$TAG" \
+            --notes "Unsigned Windows build of \`wsl-patches\` rebased on upstream $upstream. Rollback: install upstream https://github.com/stablyai/orca/releases/tag/$upstream (orca-windows-setup.exe)."
+
+      - name: Package and publish Windows artifacts
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 30
+          max_attempts: 2
+          retry_wait_seconds: 30
+          command: node config/scripts/ensure-native-runtime.mjs --runtime=electron; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; pnpm exec electron-builder --config config/electron-builder.config.cjs --win --publish always
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ORCA_WIN_FORK: '1'
+          ORCA_FORK_BUILD_VERSION: ${{ needs.sync.outputs.version }}
+          ORCA_BUILD_COMMIT: ${{ needs.sync.outputs.sha }}
+          EP_GH_IGNORE_TIME: 'true'
+
+      - name: Verify Windows update manifest published
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          assets="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+          echo "$assets"
+          for required in latest.yml orca-windows-setup.exe; do
+            grep -qx "$required" <<<"$assets" || { echo "::error::$TAG is missing $required"; exit 1; }
+          done
+
+      - name: Notify (optional ntfy)
+        if: always()
+        shell: bash
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          STATUS: ${{ job.status }}
+        run: |
+          [[ -z "$NTFY_TOPIC" ]] && exit 0
+          curl -s -o /dev/null -H "Title: orca fork build $STATUS" -d "$TAG windows build $STATUS" "https://ntfy.sh/$NTFY_TOPIC" || true
