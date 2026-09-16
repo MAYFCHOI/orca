@@ -27,6 +27,13 @@ ORCA_WSL_CWD=$(pwd -P 2>/dev/null) || {
   cd /
 }
 ORCA_BRIDGE_PS1_WIN=$(wslpath -w "$ORCA_BRIDGE_PS1")
+# Why (#20082): wslpath -w spells the distro share as \\\\wsl.localhost\\..., which
+# Windows PowerShell maps to an untrusted zone and refuses to run as -File
+# ("AuthorizationManager check failed") even under -ExecutionPolicy Bypass. The
+# legacy \\\\wsl$\\ spelling names the same share and runs without that check.
+case "$ORCA_BRIDGE_PS1_WIN" in
+  '\\\\wsl.localhost\\'*) ORCA_BRIDGE_PS1_WIN='\\\\wsl$'"\${ORCA_BRIDGE_PS1_WIN#*wsl.localhost}" ;;
+esac
 ORCA_WSL_CWD_WIN=$(wslpath -w "$ORCA_WSL_CWD")
 # Why: a PATH entry in WSLENV reaches the Windows child as "PATH" beside the "Path" it already
 # inherits, and orca.exe aborts on that case-insensitive duplicate before the CLI starts.
