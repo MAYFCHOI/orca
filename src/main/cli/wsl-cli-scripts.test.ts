@@ -74,3 +74,51 @@ describe.skipIf(process.platform === 'win32')('buildWslLauncher WSLENV sanitizat
     expect(forwardedWslenv('')).toBe('')
   })
 })
+
+// Why (#20082): Windows PowerShell refuses `-File` on the \\wsl.localhost\ share
+// ("AuthorizationManager check failed") even with -ExecutionPolicy Bypass, while
+// the legacy \\wsl$\ spelling of the same share runs. The launcher must rewrite
+// the bridge path before handing it to powershell.exe.
+describe.skipIf(process.platform === 'win32')('buildWslLauncher bridge path spelling', () => {
+  let pathStubDir: string
+
+  /** Runs the launcher with wslpath stubbed to `wslpathOutput`; returns the -File argument powershell.exe received. */
+  function bridgePathSeenByPowershell(wslpathOutput: string): string {
+    pathStubDir = mkdtempSync(join(tmpdir(), 'orca-wsl-launcher-path-'))
+    writeFileSync(join(pathStubDir, 'wslpath'), `#!/bin/sh\nprintf '%s' '${wslpathOutput}'\n`, {
+      mode: 0o755
+    })
+    // argv: -NoProfile -ExecutionPolicy Bypass -File <bridge> ...
+    writeFileSync(join(pathStubDir, 'powershell.exe'), '#!/bin/sh\nprintf "%s" "$5"\n', {
+      mode: 0o755
+    })
+    try {
+      return execFileSync('bash', ['-c', buildWslLauncher(WIN_LAUNCHER)], {
+        encoding: 'utf8',
+        env: { PATH: `${pathStubDir}:${process.env.PATH ?? ''}` }
+      })
+    } finally {
+      rmSync(pathStubDir, { recursive: true, force: true })
+    }
+  }
+
+  it('rewrites the modern \\\\wsl.localhost\\ share to the legacy \\\\wsl$\\ spelling', () => {
+    expect(
+      bridgePathSeenByPowershell(
+        '\\\\wsl.localhost\\Ubuntu\\home\\me\\.local\\share\\orca\\orca-wsl-bridge.ps1'
+      )
+    ).toBe('\\\\wsl$\\Ubuntu\\home\\me\\.local\\share\\orca\\orca-wsl-bridge.ps1')
+  })
+
+  it('leaves a path already on \\\\wsl$\\ untouched', () => {
+    expect(bridgePathSeenByPowershell('\\\\wsl$\\Ubuntu\\home\\me\\bridge.ps1')).toBe(
+      '\\\\wsl$\\Ubuntu\\home\\me\\bridge.ps1'
+    )
+  })
+
+  it('leaves a drive path untouched', () => {
+    expect(bridgePathSeenByPowershell('C:\\Users\\me\\bridge.ps1')).toBe(
+      'C:\\Users\\me\\bridge.ps1'
+    )
+  })
+})
