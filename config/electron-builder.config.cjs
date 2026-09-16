@@ -36,7 +36,10 @@ const isMacAdhoc = process.env.ORCA_MAC_ADHOC === '1'
 const isWinHourly = process.env.ORCA_WIN_HOURLY === '1'
 const isWinDaily = process.env.ORCA_WIN_DAILY === '1'
 const isWinAdhoc = process.env.ORCA_WIN_ADHOC === '1'
-const isWinDevChannel = isWinHourly || isWinDaily || isWinAdhoc
+// Fork channel: unsigned Windows builds of the wsl-patches branch, published to
+// the fork's own releases so the installed app updates from there, not upstream.
+const isWinFork = process.env.ORCA_WIN_FORK === '1'
+const isWinDevChannel = isWinHourly || isWinDaily || isWinAdhoc || isWinFork
 const isMacRelease = process.env.ORCA_MAC_RELEASE === '1' || isMacHourly || isMacDaily || isMacAdhoc
 const isLinuxArm64Release = process.env.ORCA_LINUX_ARM64_RELEASE === '1'
 const localBuildVersion =
@@ -50,7 +53,9 @@ const devChannelBuildVersion = isHourlyChannel
     ? process.env.ORCA_DAILY_BUILD_VERSION
     : isAdhocChannel
       ? process.env.ORCA_ADHOC_BUILD_VERSION
-      : undefined
+      : isWinFork
+        ? process.env.ORCA_FORK_BUILD_VERSION
+        : undefined
 // Why each dev channel gets its own repo rather than tagging into the main one:
 // the releases atom feed exposes only the 10 newest entries, so 24 hourly tags a
 // day would evict every stable/RC entry and strand users on a feed with nothing
@@ -63,7 +68,9 @@ const devChannelRepo = isHourlyChannel
     ? 'orca-daily'
     : isAdhocChannel
       ? 'orca-adhoc'
-      : null
+      : isWinFork
+        ? 'orca'
+        : null
 const appId = 'com.stablyai.orca'
 const featureWallResources = {
   from: 'resources/onboarding/feature-wall',
@@ -657,7 +664,7 @@ module.exports = {
   npmRebuild: true,
   publish: {
     provider: 'github',
-    owner: 'stablyai',
+    owner: isWinFork ? 'MAYFCHOI' : 'stablyai',
     repo: devChannelRepo ?? 'orca',
     releaseType: devChannelRepo ? 'prerelease' : 'release'
   }
